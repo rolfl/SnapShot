@@ -1,0 +1,21 @@
+SnapShot README
+===============
+
+SnapShot is designed to run from cron, and will take regular backups of
+specified folders.
+
+The concept is based on long-standing practice in the UNIX world with
+hard-links, but more specifically, the shell script by Mike Rubel was
+used as a starting point.
+http://www.mikerubel.org/computers/rsync_snapshots/
+In fact, I first used Mike's script, and then made my own perl version.
+
+The significant conceptual changes I have made are:
+
+1. Use date-based names instead of relative names. This aids sorting
+2. use a central configuration file.
+3. Enable locking of folders to allow concurrent snapshot backups, as
+   well as enabling the entire snapshot volume to be backed up to
+   remote storage.
+
+Rolf

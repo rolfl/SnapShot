@@ -1,0 +1,131 @@
+#!/usr/bin/perl -w
+
+use strict;
+use Digest::MD5;
+
+$| = 1;
+my $doit = 1;
+
+if (@ARGV and $ARGV[0] eq "-n") {
+  shift @ARGV;
+  undef $doit;
+  print"Dry Run\n";
+}
+
+sub md5sum ($) {
+  my $file = shift;
+  my $digest = "";
+  open(FILE, $file) or die "Can't find file $file\n";
+  my $ctx = Digest::MD5->new;
+  $ctx->addfile(*FILE);
+  $digest = $ctx->hexdigest;
+  close(FILE);
+  return $digest;
+}
+
+sub checkFile($$) {
+  my $basefile = shift;
+  my $checkfile = shift;
+
+  return if -l $basefile;
+  my @basestat = stat $basefile;
+  return unless -f _;
+  return if -l $checkfile;
+  my @checkstat = stat $checkfile;
+  return unless -f _;
+  return unless -w _;
+
+  # Must be same filesystem
+  return unless $basestat[0] == $checkstat[0];
+
+  # Check to see if they are the same inode already
+  return if $basestat[1] == $checkstat[1];
+
+  # need to be the same size.
+  return unless $basestat[7] == $checkstat[7];
+
+  # need to be the same permissions and ownership
+  return unless $basestat[2] == $checkstat[2];
+  return unless $basestat[4] == $checkstat[4];
+  return unless $basestat[5] == $checkstat[5];
+
+  my $basemd5 = md5sum $basefile;
+  print "md5sum: $basemd5 : $basefile\n";
+  my $checkmd5 = md5sum $checkfile;
+  print "md5sum: $checkmd5 : $checkfile\n";
+
+  return unless $basemd5 eq $checkmd5;
+
+  my $saved = 0;
+  $saved = $checkstat[7] if ($checkstat[3] == 1);
+
+  printf "%10d Bytes:  Link $basemd5:  $checkfile to $basefile ...", $saved;
+  if ($doit) {
+    my $link = "$checkfile.linkdup.deleteme";
+    print "l..";
+    link $basefile, $link or die "Could not create link from $basefile to $link: $!";
+    print "r..";
+    rename $link, $checkfile or die "Could not rename $link to $checkfile: $!";
+  } else {
+    print "dummy...";
+  }
+  print "...done.\n";
+  return $saved;
+}
+
+sub checkDir {
+  my $dirfrom = shift;
+  my $dirto = shift;
+
+  return unless $dirfrom and -d $dirfrom;
+  return unless $dirto and -d $dirto and -w $dirto;
+
+  opendir DIR, $dirto or die("Unable to access directory $dirto");
+  my @filenames = sort readdir DIR;
+  closedir DIR;
+
+  my $fname;
+  my $saved = 0;
+  foreach $fname (@filenames) {
+    next if $fname =~ m/^\.+$/;
+    my $path = "$dirto/$fname";
+    my $tmpsaved = 0;
+    if (-d $path) {
+      $tmpsaved = checkDir("$dirfrom/$fname", "$dirto/$fname");
+    } else {
+      $tmpsaved = checkFile("$dirfrom/$fname", "$dirto/$fname");
+    }
+    if ($tmpsaved) {
+      $saved += $tmpsaved;
+    }
+  }
+  return $saved;
+}
+
+my @folders;
+push @folders, @ARGV;
+
+my $basedir = shift @folders;
+
+die ("Need to specify a folder to compare from.") unless $basedir and -d $basedir;
+
+push @folders, "." unless @folders;
+
+my $allsaved = 0;
+
+foreach (@folders) {
+  my $checkdir = $_;
+  next unless $checkdir and -d $checkdir;
+
+  my $tmpsaved = checkDir($basedir, $checkdir);
+  $tmpsaved ||= 0;
+
+  print "Saved $tmpsaved Bytes by comparing $basedir and $checkdir\n";
+  $allsaved += $tmpsaved;
+
+  $basedir = $checkdir;
+}
+
+print "Saved $allsaved Bytes in total\n";
+
+

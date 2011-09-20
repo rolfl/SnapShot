@@ -1,0 +1,339 @@
+#!/usr/bin/perl -w
+# ----------------------------------------------------------------------
+# perl version of mikes handy rotating-filesystem-snapshot utility
+# ----------------------------------------------------------------------
+
+use strict;
+
+# The following are all used in the 'END' code block... and need to have some value...
+my $now        = time();
+my $id         = "Not Yet Calculated";
+my $snaplock   = "";
+my $proglock   = "";
+my $rmtmpdir   = "";
+my $exitcode   = 1;
+
+sub mysys(;@) {
+  my @cl;
+  push @cl, @_;
+  my $msg = '"' . join ('" "', @cl) . '"';
+  print "Running $msg\n";
+  system(@cl);
+  if ($? == -1) {
+    die "failed to execute: $!\n";
+  } elsif ($? & 127) {
+    die sprintf ("child died with signal %d, %s coredump\n", ($? & 127), ($? & 128) ? 'with' : 'without');
+  } elsif ($?) {
+    printf STDERR ("child exited with value %d: %s\n", $? >> 8, $msg);
+    return 0;
+  }
+  return 1;
+}
+
+# use Fcntl qw(:DEFAULT :flock);
+
+my $snapdir    = "/snapshotng";
+my $lockfile   = "$snapdir/.snap.lock";
+my $keepyears  = 10;
+my $keepmonths = 18;
+my $keepweeks  = 16;
+my $keepdays   = 14;
+my $keephours  = 48;
+
+my $configfile = shift @ARGV;
+$configfile  ||= "/etc/snapshot/snap.cfg";
+-f $configfile or die "Unable to locate config file $configfile";
+
+# Sort out locking... This creates/locks the file, clears it, writes out the process ID.
+# The file-handle is kept open for the duration of this process, and we'll let the FH
+# close with the clean-up of this code...
+# sysopen(LOCK, $lockfile, O_WRONLY | O_CREAT) or die "can't open filename $lockfile: $!";
+# flock(LOCK, LOCK_EX | LOCK_NB) or die "can't lock filename $lockfile: There is probably a snapshot already happening!";
+# truncate(LOCK, 0) or die "can't truncate filename $lockfile: $!";
+# print LOCK $$ . "\n";
+
+my $strt = time();
+# try to lock the file for a full minute... then fail.
+print "Attempting to obtain lock $lockfile\n";
+mysys("lockfile", "-5", "-r12", "$lockfile");
+$proglock = $lockfile;
+print "Locked snapshot folder with $proglock in " . ( time() - $strt ) . " seconds\n";
+
+$now = time();
+$id = buildID($now);
+
+print "SNAPSHOT PROCESS BEGINNING. Using ID $id \@ " . localtime() . "\n";
+
+my (%sourcefolders, %excludes, @order);
+
+open CONFIG, "< $configfile" or die "Could not open config file $configfile: $!";
+while (<CONFIG>) {
+  chomp;
+  $_ =~ s/#.*$//; #trim comments
+  $_ =~ s/^\s+|\s+$//g; #trim line
+  $_ =~ s/\s+/ /g; #normalize whitespace
+  next unless m/\w/; #require at least some content
+  my @parts = split / /;
+  @parts >= 2 or die "Config lines need to be of the form 'name  path [excludefile]'.";
+  $sourcefolders{$parts[0]} = $parts[1];
+  $excludes{$parts[0]} = "";
+  if (@parts == 3) {
+    $excludes{$parts[0]} = $parts[2];
+  }
+  push @order, $parts[0];
+}
+
+$exitcode = @order;
+print "Processing $exitcode folders based on the configuration file\n\n";
+foreach (@order) {
+  processSnapshot($_);
+  $exitcode--;
+}
+
+mysys ("rm", "-f", "$proglock");
+$proglock = "";
+
+END {
+    if ($proglock) {
+      print "\n\nWARNING - INTERRUPTED: Removing lock files and temporary files\n";
+      if ($rmtmpdir and -d $rmtmpdir) {
+        print "Removing Temporary folder $rmtmpdir (can take a long time). Please let this finish!\n";
+        system("rm -rf $rmtmpdir");
+        print "Done!\n";
+      }
+      if ($snaplock && -f $snaplock) {
+        print "Removing lock file $snaplock\n";
+        system("rm -f $snaplock");
+      }
+      print "Removing lock file $proglock\n";
+      system("rm -f $proglock");
+    }
+    # truncate(LOCK, 0) or die "Can't truncate lock file to indicate completion: $!";;
+    # close (LOCK) or die "Can't close lock file: $!";
+    my $secs = time() - $now;
+    printf ("SNAPSHOT PROCESS COMPLETE. Using ID %s \@ %s" . localtime() . " in %d minutes, %02d seconds\n", $id, scalar(localtime()), int($secs / 60.0), ($secs % 60));
+    if ($exitcode) {
+      print "Failed to process successfully... there is an exitcode of $exitcode\n";
+      exit $exitcode;
+    }
+}
+
+exit 0;
+
+### END OF PROGRAM, The following are the implementing subroutines.
+
+sub buildID {
+  my $now = shift;
+  $now ||= time();
+  my @date = localtime($now);
+  my $year = $date[5] + 1900;
+  my $month = $date[4] + 1;
+  my $day = $date[3];
+  my $hour = $date[2];
+  my $min = $date[1];
+  return sprintf ("%04d.%02d.%02d.%02d.%02d", $year, $month, $day, $hour, $min) ;
+}
+
+sub lastYears($) {
+  my $name = shift;
+  my $to = (localtime($now))[5] + 1900;
+  my $from = $to - $keepyears + 1;
+  my @ret;
+  for ($from .. $to) {
+    push @ret, sprintf('^%s\.%04d\..*$', $name, $_);
+  }
+  return @ret;
+}
+
+sub lastMonths($) {
+  my $name = shift;
+  my $yr =  (localtime($now))[5] + 1900 - int($keepmonths / 12);
+  my $tom = (localtime($now))[4] + 1;
+  my $fom = $tom - ($keepmonths % 12) + 1;
+  if ($fom <= 0) {
+    $yr--;
+    $fom += 12;
+  }
+
+  my @ret;
+  for (1 .. $keepmonths) {
+    push @ret, sprintf('^%s\.%04d\.%02d\..*$', $name, $yr, $fom);
+    $fom++;
+    if ($fom > 12) {
+      $fom = 1;
+      $yr++;
+    }
+  }
+  return @ret;
+}
+
+sub lastWeeks($) {
+  my $name = shift;
+  my $tm = $now;
+  my $dy = 60 * 60 * 24;
+  my $week = $dy * 7;
+  # Hunt backwards for the previous sunday.
+  while ((localtime($tm))[6] > 0) {
+    $tm -= $dy;
+  }
+  $tm -= ($keepweeks - 1) * $week;
+  my @ret;
+  for (1 .. $keepweeks) {
+    my ($day, $mon, $yr) = (localtime($tm))[3..5];
+    push @ret, sprintf('^%s\.%04d\.%02d\.%02d\..*$', $name, $yr + 1900, $mon + 1, $day);
+    $tm += $week;
+  }
+  # print "Weeks:\n  " . join("\n  ", @ret) . "\n";
+  return @ret;
+}
+
+sub lastDays($) {
+  my $name = shift;
+  my $tm = $now;
+  my $dy = 60 * 60 * 24;
+  $tm -= ($keepdays - 1) * $dy;
+  my @ret;
+  for (1 .. $keepdays) {
+    my ($day, $mon, $yr) = (localtime($tm))[3..5];
+    push @ret, sprintf('^%s\.%04d\.%02d\.%02d\..*$', $name, $yr + 1900, $mon + 1, $day);
+    $tm += $dy;
+  }
+  return @ret;
+}
+
+sub lastHours($) {
+  my $name = shift;
+  my $tm = $now;
+  my $hr = 60 * 60;
+  $tm -= ($keephours - 1) * $hr;
+  my @ret;
+  for (1 .. $keephours) {
+    my ($hour, $day, $mon, $yr) = (localtime($tm))[2..5];
+    push @ret, sprintf('^%s\.%04d\.%02d\.%02d\.%02d\..*$', $name, $yr + 1900, $mon + 1, $day, $hour);
+    $tm += $hr;
+  }
+  return @ret;
+}
+
+sub cleanAndLatest($$) {
+  my $name = shift;
+  my $folder = shift;
+  opendir DIR, $folder or die "Unable to read folder $folder: $!";
+  my @files;
+  my $dir;
+  foreach $dir (readdir DIR) {
+    next unless -d "$folder/$dir";
+    next if $dir =~ m/^trash\..*/;
+    next if -l "$folder/$dir";
+    if ($dir =~ m/(yearly|monthly|weekly|daily|hourly|adhoc)\.\d+/) {
+      my $os = 0;
+      my $nname;
+      do {
+        my $cid = buildID((stat "$folder/$dir")[9] + $os);
+        $nname = "$name.$cid";
+        $os += 60;
+      } while (-x "$folder/$nname");
+      print "renaming $folder/$dir to $folder/$nname\n";
+      mysys("mv", "$folder/$dir", "$folder/$nname") or die "Unable to move file.";
+      $dir = $nname;
+    }
+    next unless $dir =~ m/$name\.\d\d\d\d\.\d\d\.\d\d\.\d\d.\d\d/;
+    push @files, $dir;
+  }
+  closedir DIR;
+  return undef unless @files;
+
+  # my @tokeep;
+  my @toremove;
+  my @rules;
+  # Add the year rules...
+  push @rules, lastYears $name;
+  push @rules, lastMonths $name;
+  push @rules, lastWeeks $name;
+  push @rules, lastDays $name;
+  push @rules, lastHours $name;
+
+  print "Rules:\n  " .join ("\n  ", @rules) . "\n";
+  @files = sort @files;
+  my $latest;
+  foreach $dir (@files) {
+    my $found = 0;
+    my $rn = 0;
+    while ($rn < @rules) {
+      if ($dir =~ m/$rules[$rn]/) {
+        $found = 1;
+        $latest = $dir;
+        print "Matched $dir to rule " . $rules[$rn] . "\n";
+        splice @rules, $rn, 1;
+        last;
+      } else {
+        $rn++;
+      }
+    }
+    # push @tokeep, $dir if $found;
+    push @toremove, $dir unless $found;
+  }
+
+  print "Latest is $latest\n";
+
+  # exit 1;
+
+  foreach (@toremove) {
+    mysys("mv", "$folder/$_", "$folder/trash.$_") or die "Unable to rename file to trash";
+  }
+
+  return $latest;
+  
+}
+
+sub processSnapshot {
+  my $name = shift;
+  my $folder = $sourcefolders{$name};
+  my $exclude = $excludes{$name};
+  my $outdir = "$snapdir/$name";
+  if ($exclude) {
+    # Make the exclude relative to the output dir unless it is already absolute.
+    $exclude = "$outdir/$exclude" unless $exclude =~ m/^\/.*/;
+  } else {
+    $exclude = "";
+  }
+  if ($exclude and ! -r $exclude) {
+    # print "Exclude file $exclude does not exist! Ignoring it!\n";
+    $exclude = "";
+  }
+  print "\n\nSnapshot $name:  $folder \@ " . localtime() ."\n";
+  -d $outdir or mysys("mkdir", "-p", "$outdir") or die "Unable to make folder $outdir";
+
+  my $mysnaplock = "$outdir/.snapshot.lock";
+  $strt = time();
+  mysys("lockfile", "-5", "-r-1", "$mysnaplock");
+  $snaplock = $mysnaplock;
+  print "Locked snapshot folder with $snaplock in " . ( time() - $strt ) . " seconds\n";
+
+  my $tmpdir = "$outdir/tmpsnap";
+  -d $tmpdir and die "There already is a folder $tmpdir. Perhaps a previous snapshot was aborted. Please clean this up before we can continue.\n";
+  my $latest = cleanAndLatest($name, $outdir);
+  $rmtmpdir = $tmpdir;
+  if ($latest) {
+    print "Using previous snapshot $outdir/$latest as the baseline.\n";
+    mysys("cp", "-alH", "$outdir/$latest", "$tmpdir") or die "Failed to create linked copy of latest snapshot $latest!";
+  } else {
+    print "No previous snapshot baseline.\n";
+    mysys("mkdir", "-p", "$tmpdir");
+  }
+  my @args;
+  push @args, "-v", "-a", "--delete";
+  if ($exclude){
+    print "****  Using Exclude file $exclude ****\n";
+    push @args, "--exclude-from=$exclude", "--delete-excluded";
+  }
+  mysys("rsync", @args, "$folder/", "$tmpdir/") or die "Unable to complete rSync!";
+  mysys("mv", "$tmpdir", "$outdir/$name.$id") or die "Unable to rename rSync!";
+  $rmtmpdir = "";
+  mysys("rm", "-f", "$snaplock");
+  $snaplock="";
+  print "Completed snapshot for $folder in to $outdir/$name.$id \@ " . localtime() . "\n\n\n";
+}
+
+
+
